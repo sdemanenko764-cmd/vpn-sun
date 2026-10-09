@@ -27,7 +27,10 @@ jobs:
         id: source
         shell: pwsh
         run: |
-          $zip = Get-ChildItem downloads/Sun-VPN-*-source.zip | Sort-Object LastWriteTime | Select-Object -Last 1
+          # Checkout gives every file the same mtime: pick the highest version by name.
+          $zip = Get-ChildItem downloads/Sun-VPN-*-source.zip |
+            Sort-Object { [version]($_.Name -replace '^Sun-VPN-(.+)-source\.zip$', '$1') } |
+            Select-Object -Last 1
           $expected = (Get-Content "$($zip.FullName).sha256").Split(' ')[0]
           $actual = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($actual -ne $expected) { throw "Source archive SHA-256 mismatch" }

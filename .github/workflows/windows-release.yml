@@ -87,20 +87,27 @@ jobs:
             if (-not $process.WaitForExit(180000)) { $process.Kill(); throw "$what did not finish in 3 minutes" }
             if ($process.ExitCode -ne 0) { throw "$what exit code $($process.ExitCode)" }
           }
-          WaitFor (Start-Process $setup -ArgumentList '/S' -PassThru) 'Silent install'
+          # Upgrade path users take: install the previous published setup, then update it.
+          $previous = Get-ChildItem downloads\Sun-VPN-*-Windows-x64-setup.exe |
+            Where-Object { $_.Name -ne "$name-setup.exe" } |
+            Sort-Object { [version]($_.Name -replace '^Sun-VPN-(.+)-Windows-x64-setup\.exe$', '$1') } |
+            Select-Object -Last 1
+          $first = if ($previous) { $previous.FullName } else { $setup }
+          Write-Host "First install: $first"
+          WaitFor (Start-Process $first -ArgumentList '/S' -PassThru) 'Silent install'
           $main = (Get-ItemProperty $key).MainBinaryName
           $installed = Join-Path $dir $main
           if (-not (Test-Path $installed)) { Get-ChildItem $dir -ErrorAction SilentlyContinue; throw 'Installed EXE missing' }
-          # The bundler stamps the bundle type (nsis) into the binary in place: same size, not same bytes.
-          if ((Get-Item $installed).Length -ne (Get-Item "downloads\$name.exe").Length) { throw 'Installed EXE is not the portable build' }
           if (-not (Test-Path (Join-Path $dir 'uninstall.exe'))) { throw 'uninstall.exe missing (updater detects installs by it)' }
-          if ((Get-ItemProperty $key).DisplayVersion -ne $env:VERSION) { throw 'Wrong DisplayVersion' }
           # Exactly the command line the app runs for an update (update/files.rs installer_command).
           $line = "/d /s /c `"ping -n 3 127.0.0.1 >nul & start `"`" /wait `"$setup`" /P /UPDATE & start `"`" `"$installed`" --after-update 0`""
           WaitFor (Start-Process cmd.exe -ArgumentList $line -PassThru -WindowStyle Hidden) 'Update via cmd'
           $deadline = (Get-Date).AddSeconds(60)
           do { Start-Sleep 2; $app = Get-Process ([IO.Path]::GetFileNameWithoutExtension($main)) -ErrorAction SilentlyContinue | Select-Object -First 1 } until ($app -or (Get-Date) -gt $deadline)
           if (-not $app) { throw 'App was not restarted after the update' }
+          if ((Get-ItemProperty $key).DisplayVersion -ne $env:VERSION) { throw "Update left version $((Get-ItemProperty $key).DisplayVersion)" }
+          # The bundler stamps the bundle type (nsis) into the binary in place: same size, not same bytes.
+          if ((Get-Item $installed).Length -ne (Get-Item "downloads\$name.exe").Length) { throw 'Updated EXE is not the new build' }
           if ($app.Path -ne $installed) { throw "Restarted from $($app.Path)" }
           $app | Stop-Process -Force
           Start-Sleep 2

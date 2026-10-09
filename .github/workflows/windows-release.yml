@@ -91,7 +91,8 @@ jobs:
           $main = (Get-ItemProperty $key).MainBinaryName
           $installed = Join-Path $dir $main
           if (-not (Test-Path $installed)) { Get-ChildItem $dir -ErrorAction SilentlyContinue; throw 'Installed EXE missing' }
-          if ((Get-FileHash $installed).Hash -ne (Get-FileHash "downloads\$name.exe").Hash) { throw 'Installed EXE differs from the portable build' }
+          # The bundler stamps the bundle type (nsis) into the binary in place: same size, not same bytes.
+          if ((Get-Item $installed).Length -ne (Get-Item "downloads\$name.exe").Length) { throw 'Installed EXE is not the portable build' }
           if (-not (Test-Path (Join-Path $dir 'uninstall.exe'))) { throw 'uninstall.exe missing (updater detects installs by it)' }
           if ((Get-ItemProperty $key).DisplayVersion -ne $env:VERSION) { throw 'Wrong DisplayVersion' }
           # Exactly the command line the app runs for an update (update/files.rs installer_command).

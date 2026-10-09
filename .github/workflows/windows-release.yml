@@ -1,5 +1,6 @@
-# Builds the Windows portable EXE from the published source archive on a real
-# Windows/MSVC runner and commits EXE, ZIP and SHA-256 files next to it.
+# Builds the Windows portable EXE and the NSIS setup from the published source archive
+# on a real Windows/MSVC runner, smoke-tests install, update and uninstall, then commits
+# EXE, setup, ZIP, SHA-256 files and latest.json (read by the in-app updater).
 name: Sun VPN Windows release
 on:
   push:
@@ -48,6 +49,7 @@ jobs:
         run: |
           $name = "Sun-VPN-$env:VERSION-Windows-x64"
           $exe = "$env:RUNNER_TEMP\src\Sun-VPN\artifacts\$name.exe"
+          $setup = "$env:RUNNER_TEMP\src\Sun-VPN\artifacts\$name-setup.exe"
           $bytes = [IO.File]::ReadAllBytes($exe)
           $pe = [BitConverter]::ToInt32($bytes, 0x3c)
           if ([BitConverter]::ToUInt16($bytes, $pe + 4) -ne 0x8664) { throw 'Not x64' }
@@ -57,19 +59,75 @@ jobs:
           $imports
           if ($imports -match '^(WebView2Loader|vcruntime|msvcp|libgcc|libwinpthread)') { throw 'Unexpected runtime DLL dependency' }
           Copy-Item $exe "downloads\$name.exe"
+          Copy-Item $setup "downloads\$name-setup.exe"
           $staging = "$env:RUNNER_TEMP\zip"
           New-Item -ItemType Directory $staging | Out-Null
           Copy-Item $exe "$staging\$name.exe"
           @("Sun VPN $env:VERSION Windows x64",
-            'Закройте предыдущую версию. Распакуйте архив и запустите EXE.',
-            'Для TUN нужны права администратора и установленный WebView2 Runtime.',
-            'Обновите подписки после запуска.') | Set-Content "$staging\READ-ME.txt" -Encoding utf8
+            "Проще всего установить: $name-setup.exe (ярлыки, автообновление).",
+            'Переносная версия: распакуйте архив и запустите EXE.',
+            'Для TUN нужны права администратора и установленный WebView2 Runtime.') | Set-Content "$staging\READ-ME.txt" -Encoding utf8
           Compress-Archive "$staging\*" "downloads\$name.zip" -Force
-          foreach ($file in @("$name.exe", "$name.zip")) {
+          foreach ($file in @("$name.exe", "$name-setup.exe", "$name.zip")) {
             $hash = (Get-FileHash "downloads\$file" -Algorithm SHA256).Hash.ToLowerInvariant()
             [IO.File]::WriteAllText("$PWD\downloads\$file.sha256", "$hash  $file`n")
             Get-Content "downloads\$file.sha256"
           }
+      - name: Smoke-test setup (install, update, uninstall)
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          $name = "Sun-VPN-$env:VERSION-Windows-x64"
+          $setup = (Resolve-Path "downloads\$name-setup.exe").Path
+          $dir = "$env:LOCALAPPDATA\Sun VPN"
+          $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Sun VPN'
+          function WaitFor($process, $what) {
+            $null = $process.Handle  # cache the handle so ExitCode stays readable
+            if (-not $process.WaitForExit(180000)) { $process.Kill(); throw "$what did not finish in 3 minutes" }
+            if ($process.ExitCode -ne 0) { throw "$what exit code $($process.ExitCode)" }
+          }
+          WaitFor (Start-Process $setup -ArgumentList '/S' -PassThru) 'Silent install'
+          $main = (Get-ItemProperty $key).MainBinaryName
+          $installed = Join-Path $dir $main
+          if (-not (Test-Path $installed)) { Get-ChildItem $dir -ErrorAction SilentlyContinue; throw 'Installed EXE missing' }
+          if ((Get-FileHash $installed).Hash -ne (Get-FileHash "downloads\$name.exe").Hash) { throw 'Installed EXE differs from the portable build' }
+          if (-not (Test-Path (Join-Path $dir 'uninstall.exe'))) { throw 'uninstall.exe missing (updater detects installs by it)' }
+          if ((Get-ItemProperty $key).DisplayVersion -ne $env:VERSION) { throw 'Wrong DisplayVersion' }
+          # Exactly the command line the app runs for an update (update/files.rs installer_command).
+          $line = "/d /s /c `"ping -n 3 127.0.0.1 >nul & start `"`" /wait `"$setup`" /P /UPDATE & start `"`" `"$installed`" --after-update 0`""
+          WaitFor (Start-Process cmd.exe -ArgumentList $line -PassThru -WindowStyle Hidden) 'Update via cmd'
+          $deadline = (Get-Date).AddSeconds(60)
+          do { Start-Sleep 2; $app = Get-Process ([IO.Path]::GetFileNameWithoutExtension($main)) -ErrorAction SilentlyContinue | Select-Object -First 1 } until ($app -or (Get-Date) -gt $deadline)
+          if (-not $app) { throw 'App was not restarted after the update' }
+          if ($app.Path -ne $installed) { throw "Restarted from $($app.Path)" }
+          $app | Stop-Process -Force
+          Start-Sleep 2
+          WaitFor (Start-Process (Join-Path $dir 'uninstall.exe') -ArgumentList '/S', "_?=$dir" -PassThru) 'Silent uninstall'
+          if (Test-Path $installed) { throw 'Uninstall left the EXE' }
+          if (Test-Path $key) { throw 'Uninstall left the registry entry' }
+          Write-Host 'Setup install, update (cmd + /P /UPDATE + restart) and uninstall: OK'
+      - name: Write update manifest
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          $name = "Sun-VPN-$env:VERSION-Windows-x64"
+          function Entry($file) {
+            [ordered]@{ file = $file; sha256 = (Get-FileHash "downloads\$file" -Algorithm SHA256).Hash.ToLowerInvariant(); size = (Get-Item "downloads\$file").Length }
+          }
+          $notesFile = "$env:RUNNER_TEMP\src\Sun-VPN\RELEASE-NOTES.txt"
+          $notes = if (Test-Path $notesFile) { (Get-Content $notesFile -Raw -Encoding utf8).Trim() } else { '' }
+          $manifest = [ordered]@{
+            version = $env:VERSION
+            date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd')
+            notes = $notes
+            setup = Entry "$name-setup.exe"
+            portable = Entry "$name.exe"
+          }
+          # UTF-8 without BOM: the app parses it with serde_json.
+          [IO.File]::WriteAllText("$PWD\downloads\latest.json", ($manifest | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
+          Get-Content downloads\latest.json
       - name: Commit binaries
         shell: pwsh
         env:
